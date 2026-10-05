@@ -1,0 +1,282 @@
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+import shutil
+import subprocess
+from datetime import datetime, timezone
+
+from config.settings import PostgresConfig
+from databases.base import DatabaseAdapter
+from error_handling import BackupTypeNotSupportedError
+
+log = logging.getLogger(__name__)
+
+MANIFEST = "backup_manifest"
+MIN_PG_VERSION_NUM = 170000  # native incremental backup arrived in PostgreSQL 17
+
+
+class Postgres(DatabaseAdapter):
+    """
+    Two backup families, deliberately kept separate:
+
+    LOGICAL (default)  pg_dump -Fc  -> single file, one database, portable.
+                       Restore with pg_restore. Works on any server, no config.
+
+    PHYSICAL (opt-in)  pg_basebackup + PG17 incremental -> directory per backup,
+                       whole cluster. Needed for incremental / differential.
+                       Restore = pg_combinebackup -> a data directory you start
+                       a server on (it cannot be applied to a running server).
+    """
+
+    def __init__(self, config: PostgresConfig, state_file: str = "pg_backup_state.json"):
+        super().__init__(config)
+        self._database = config.database
+        self._state_file = os.path.abspath(state_file)
+
+        # Merge with the real environment: replacing it drops PATH, HOME, etc.
+        env = {
+            **os.environ,
+            "PGHOST": config.host,
+            "PGPORT": str(config.port),
+            "PGUSER": config.user,
+            "PGDATABASE": config.database,
+            "PGCONNECT_TIMEOUT": "10",
+        }
+        if config.password:
+            env["PGPASSWORD"] = config.password
+        self._env = env
+
+    # ------------------------------------------------------------------
+    # Process helpers
+    # ------------------------------------------------------------------
+    def _run(self, cmd: list[str], timeout: int | None = None) -> subprocess.CompletedProcess | None:
+        """Run a command. Returns None if it could not run or timed out."""
+        try:
+            res = subprocess.run(
+                cmd, env=self._env, capture_output=True, text=True,
+                timeout=timeout, stdin=subprocess.DEVNULL,
+            )
+        except FileNotFoundError:
+            log.error("'%s' is not installed or not in PATH", cmd[0])
+            return None
+        except subprocess.TimeoutExpired:
+            log.error("'%s' timed out after %ss", cmd[0], timeout)
+            return None
+        if res.returncode != 0:
+            log.error("%s failed: %s", cmd[0], res.stderr.strip())
+        return res
+
+    @staticmethod
+    def _ok(res: subprocess.CompletedProcess | None) -> bool:
+        return res is not None and res.returncode == 0
+
+    def _sql(self, query: str, timeout: int = 30, sep: str = "|") -> str | None:
+        """Run one query via psql; returns stripped stdout or None on failure."""
+        res = self._run(
+            ["psql", "-X", "-w", "-q", "-t", "-A", "-F", sep,
+             "-v", "ON_ERROR_STOP=1", "-c", query],
+            timeout=timeout,
+        )
+        return res.stdout.strip() if self._ok(res) else None
+
+    # ------------------------------------------------------------------
+    # Connection / metadata
+    # ------------------------------------------------------------------
+    def test_connection(self) -> bool:
+        # pg_isready only proves the server is up; SELECT 1 also proves the credentials.
+        return self._sql("SELECT 1", timeout=15) == "1"
+
+    def get_db_info(self) -> dict:
+        sep = "\x1f"
+        out = self._sql(
+            "SELECT version(), pg_database_size(current_database()), "
+            "(SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public')",
+            sep=sep,
+        )
+        if out is None:
+            return {"error": "Could not query the database"}
+        try:
+            version, size, tables = out.split(sep)
+            return {
+                "db_type": "postgres",
+                "host": self._env["PGHOST"],
+                "database": self._database,
+                "version": version,
+                "size_bytes": int(size),
+                "tables_count": int(tables),
+            }
+        except ValueError:
+            return {"error": f"Unexpected psql output: {out!r}"}
+
+    # ------------------------------------------------------------------
+    # Full backup
+    # ------------------------------------------------------------------
+    def dump_full_data(self, output_path: str, physical: bool = False) -> bool:
+        """
+        physical=False: logical dump (custom format) to a single file.
+        physical=True : base backup into the directory `output_path`; this is the
+                        anchor for dump_incremental_data / dump_differential_data.
+        """
+        if physical:
+            return self._basebackup(output_path, kind="full", parent=None)
+
+        tmp = output_path + ".partial"  # never leave a half-written file at the real path
+        res = self._run(["pg_dump", "-w", "-Fc", "-f", tmp])  # no timeout: size is unbounded
+        if not self._ok(res):
+            self._remove(tmp)
+            return False
+        os.replace(tmp, output_path)
+        log.info("Logical full backup saved to %s", output_path)
+        return True
+
+    # ------------------------------------------------------------------
+    # Incremental / differential (PostgreSQL 17+ physical chain)
+    # ------------------------------------------------------------------
+    def dump_incremental_data(self, output_path: str) -> bool:
+        """Changes since the most recent backup of any kind."""
+        return self._dump_delta(output_path, kind="incremental")
+
+    def dump_differential_data(self, output_path: str) -> bool:
+        """Changes since the most recent *full* physical backup."""
+        return self._dump_delta(output_path, kind="differential")
+
+    def _dump_delta(self, output_path: str, kind: str) -> bool:
+        state = self._load_state()
+        parent = state.get("last_full") if kind == "differential" else state.get("last")
+        if not parent:
+            raise BackupTypeNotSupportedError(
+                f"No physical base backup found. Run dump_full_data(path, physical=True) "
+                f"before taking an {kind} backup."
+            )
+        if not os.path.isfile(os.path.join(parent, MANIFEST)):
+            log.error("Parent backup %s is missing or has no %s", parent, MANIFEST)
+            return False
+        return self._basebackup(output_path, kind=kind, parent=parent)
+
+    def _basebackup(self, output_path: str, kind: str, parent: str | None) -> bool:
+        out = os.path.abspath(output_path)
+        if os.path.isdir(out) and os.listdir(out):
+            log.error("%s already exists and is not empty", out)
+            return False
+        if not self._check_physical_support():
+            return False
+
+        label = f"{kind}-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}"
+        cmd = ["pg_basebackup", "-w", "-D", out, "-F", "p", "-X", "stream",
+               "-c", "fast", "-l", label]
+        if parent:
+            cmd.append(f"--incremental={os.path.join(parent, MANIFEST)}")
+
+        if not self._ok(self._run(cmd)):
+            # Typical cause: the parent's WAL summaries were already purged
+            # (wal_summary_keep_time, default 10 days) -> take a new full backup.
+            shutil.rmtree(out, ignore_errors=True)
+            return False
+
+        state = self._load_state()
+        state.setdefault("backups", {})[out] = {
+            "kind": kind,
+            "parent": parent,
+            "created": datetime.now(timezone.utc).isoformat(),
+        }
+        state["last"] = out
+        if kind == "full":
+            state["last_full"] = out
+        self._save_state(state)
+        log.info("Physical %s backup saved to %s", kind, out)
+        return True
+
+    def _check_physical_support(self) -> bool:
+        ver = self._sql("SHOW server_version_num")
+        if not ver or int(ver) < MIN_PG_VERSION_NUM:
+            log.error("Server must be PostgreSQL 17+ for incremental backups (got %s)", ver)
+            return False
+        if self._sql("SHOW summarize_wal") != "on":
+            log.error("Set summarize_wal = on (and reload) on the server first")
+            return False
+        res = self._run(["pg_basebackup", "--version"], timeout=10)
+        m = re.search(r"(\d+)", res.stdout) if self._ok(res) else None
+        if not m or int(m.group(1)) < 17:
+            log.error("pg_basebackup client must be version 17+")
+            return False
+        return True
+
+    # ------------------------------------------------------------------
+    # Restore
+    # ------------------------------------------------------------------
+    def restore_backup(self, backup_file_path: str, target_dir: str | None = None) -> bool:
+        """
+        File      -> logical restore into the configured database (atomic, all-or-nothing).
+        Directory -> physical restore: combines the full + incremental chain into
+                     `target_dir`, a ready-to-start data directory.
+        """
+        if os.path.isdir(backup_file_path):
+            return self._restore_physical(backup_file_path, target_dir)
+
+        res = self._run(
+            ["pg_restore", "-w", "--clean", "--if-exists", "--no-owner",
+             "--single-transaction", "-d", self._database, backup_file_path]
+        )
+        if self._ok(res):
+            log.info("Restore completed")
+            return True
+        return False
+
+    def _restore_physical(self, backup_dir: str, target_dir: str | None) -> bool:
+        if not target_dir:
+            log.error("target_dir is required for a physical restore")
+            return False
+        if os.path.isdir(target_dir) and os.listdir(target_dir):
+            log.error("%s already exists and is not empty", target_dir)
+            return False
+        try:
+            chain = self._chain(backup_dir)
+        except ValueError as e:
+            log.error("%s", e)
+            return False
+
+        log.info("Combining %d backup(s): %s", len(chain), " -> ".join(chain))
+        res = self._run(["pg_combinebackup", *chain, "-o", target_dir])
+        if not self._ok(res):
+            shutil.rmtree(target_dir, ignore_errors=True)
+            return False
+        log.info("Data directory ready at %s - start a PG17+ server on it", target_dir)
+        return True
+
+    def _chain(self, backup_dir: str) -> list[str]:
+        """Oldest -> newest list of backups needed to restore `backup_dir`."""
+        backups = self._load_state().get("backups", {})
+        chain, cur = [], os.path.abspath(backup_dir)
+        while cur:
+            entry = backups.get(cur)
+            if entry is None:
+                raise ValueError(f"{cur} is not a known backup in {self._state_file}")
+            chain.append(cur)
+            cur = entry["parent"]
+        return chain[::-1]
+
+    # ------------------------------------------------------------------
+    # State file (records parent links between physical backups)
+    # ------------------------------------------------------------------
+    def _load_state(self) -> dict:
+        try:
+            with open(self._state_file, encoding="utf-8") as f:
+                return json.load(f)
+        except FileNotFoundError:
+            return {}
+
+    def _save_state(self, state: dict) -> None:
+        tmp = self._state_file + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2)
+        os.replace(tmp, self._state_file)
+
+    @staticmethod
+    def _remove(path: str) -> None:
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
